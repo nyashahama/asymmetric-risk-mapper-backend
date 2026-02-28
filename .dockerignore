@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# Local environment — never bake secrets into the image
+.env
+.env.*
+!.env.example
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Test artefacts
+**/*_test.go
+**/testdata/
+
+# Build output (we build inside Docker, not before)
+bin/
+dist/
+
+# SQL migration tools (not needed in the runtime image)
+migrate
+sqlc
+
+# Docker files themselves (no need to copy into the context)
+Dockerfile*
+docker-compose*.yml

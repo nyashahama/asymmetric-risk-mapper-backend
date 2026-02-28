@@ -1,0 +1,71 @@
+version: "3.9"
+
+# ── Local development stack ────────────────────────────────────────────────────
+# Usage:
+#   docker compose up            # start postgres + api
+#   docker compose up -d db      # start only postgres (run api with `go run`)
+#   docker compose down -v       # stop everything and wipe the DB volume
+
+services:
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: arm
+      POSTGRES_PASSWORD: arm
+      POSTGRES_DB: arm
+    ports:
+      - "5432:5432" # expose to host so you can connect with psql / DBeaver
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Uncomment to auto-run your schema on first boot:
+      # - ./sql/schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U arm -d arm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ── API server ────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      ENV: development
+      PORT: "8080"
+      BASE_URL: "http://localhost:8080"
+
+      # Postgres — points at the db service defined above
+      DATABASE_URL: "postgresql://postgres:Gyver@378@localhost:5432/arm?sslmode=disable"
+
+      # ── Secrets — override these or use a .env file ────────────────────────
+      # docker compose will automatically load a .env file in the same directory.
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      RESEND_API_KEY: ${RESEND_API_KEY}
+
+      # Optional overrides
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-opus-4-6}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-chat}
+      WORKER_COUNT: ${WORKER_COUNT:-3}
+      POLL_INTERVAL: ${POLL_INTERVAL:-30s}
+      JOB_TIMEOUT: ${JOB_TIMEOUT:-5m}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:
