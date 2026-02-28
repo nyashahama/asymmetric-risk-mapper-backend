@@ -89,7 +89,11 @@ func (c *stripeClient) GetClientSecret(ctx context.Context, paymentIntentID stri
 // event. Returns an error if the signature is invalid or the tolerance window
 // (300 seconds by default in the Stripe SDK) has expired.
 func (c *stripeClient) VerifyWebhook(payload []byte, sigHeader string, secret string) (Event, error) {
-	stripeEvent, err := webhook.ConstructEvent(payload, sigHeader, secret)
+	stripeEvent, err := webhook.ConstructEventWithOptions(payload, sigHeader, secret,
+		webhook.ConstructEventOptions{
+			IgnoreAPIVersionMismatch: true,
+		},
+	)
 	if err != nil {
 		return Event{}, fmt.Errorf("stripe: webhook verification failed: %w", err)
 	}
