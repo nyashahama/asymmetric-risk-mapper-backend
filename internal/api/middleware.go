@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
@@ -16,8 +17,8 @@ import (
 type contextKey string
 
 const (
-	ctxKeySessionID  contextKey = "session_id"
-	ctxKeyAnonToken  contextKey = "anon_token"
+	ctxKeySessionID contextKey = "session_id"
+	ctxKeyAnonToken contextKey = "anon_token"
 )
 
 // ─── ANON TOKEN AUTH ──────────────────────────────────────────────────────────
@@ -64,13 +65,7 @@ func (s *Server) requireAnonToken(next http.Handler) http.Handler {
 // chi_URLParam wraps chi.URLParam to avoid importing chi in every file.
 // Defined here once; handlers call this helper.
 func chi_URLParam(r *http.Request, key string) string {
-	// chi stores URL params in the request context via its own key type.
-	// We re-export the accessor here so handler files don't import chi directly.
-	// If you prefer, you can just import chi in handler files — both are fine.
-	return middleware.GetReqID(r.Context()) // placeholder — replace with chi.URLParam(r, key)
-	// ^^^ Replace the line above with: return chi.URLParam(r, key)
-	// It is written this way to avoid a direct chi import in middleware.go.
-	// In practice, just import chi here or in each handler file.
+	return chi.URLParam(r, key)
 }
 
 // ─── CORS ─────────────────────────────────────────────────────────────────────
