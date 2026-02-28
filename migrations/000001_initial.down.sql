@@ -1,0 +1,15 @@
+DROP VIEW  IF EXISTS public_risk_stats;
+DROP TABLE IF EXISTS email_log;
+DROP TABLE IF EXISTS stripe_events;
+DROP TABLE IF EXISTS risk_results;
+DROP TABLE IF EXISTS reports;
+DROP TABLE IF EXISTS answers;
+DROP TABLE IF EXISTS question_definitions;
+DROP TABLE IF EXISTS sessions;
+DROP TYPE  IF EXISTS section_id;
+DROP TYPE  IF EXISTS report_status;
+DROP TYPE  IF EXISTS payment_status;
+DROP TYPE  IF EXISTS risk_tier;
+DROP TYPE  IF EXISTS question_type;
+DROP EXTENSION IF EXISTS citext;
+DROP EXTENSION IF EXISTS pgcrypto;
