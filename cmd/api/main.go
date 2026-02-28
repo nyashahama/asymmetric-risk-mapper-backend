@@ -164,10 +164,10 @@ func run(logger *slog.Logger) error {
 	return nil
 }
 
-// openDB opens the connection pool and prepares all sqlc statements.
-// Using db.Prepare (rather than db.New) means every query is validated against
-// the database schema at startup — the server refuses to start if the schema
-// is out of sync.
+// openDB opens the connection pool and verifies connectivity.
+// Uses db.New (unprepared queries) instead of db.Prepare so the app works
+// with PgBouncer in transaction-pooling mode (e.g. Supabase port 6543).
+// Prepared statements are incompatible with transaction-mode pooling.
 func openDB(dsn string) (*sql.DB, *db.Queries, error) {
 	pool, err := sql.Open("postgres", dsn)
 	if err != nil {
@@ -189,14 +189,10 @@ func openDB(dsn string) (*sql.DB, *db.Queries, error) {
 		return nil, nil, fmt.Errorf("ping: %w", err)
 	}
 
-	// Prepare all sqlc statements. This validates the SQL against the live
-	// schema — any mismatch (missing column, renamed table) is caught here,
-	// not at the first query execution.
-	queries, err := db.Prepare(ctx, pool)
-	if err != nil {
-		pool.Close()
-		return nil, nil, fmt.Errorf("prepare statements: %w", err)
-	}
+	// db.New uses unprepared queries — compatible with PgBouncer transaction
+	// pooling mode. If you ever switch to a direct connection you can swap this
+	// back to db.Prepare for startup-time schema validation.
+	queries := db.New(pool)
 
 	return pool, queries, nil
 }
