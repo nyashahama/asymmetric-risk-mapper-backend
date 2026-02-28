@@ -44,7 +44,7 @@ services:
       BASE_URL: "http://localhost:8080"
 
       # Postgres — points at the db service defined above
-      DATABASE_URL: "postgresql://postgres:Gyver@378@localhost:5432/arm?sslmode=disable"
+      DATABASE_URL: "${DATABASE_URL}"
 
       # ── Secrets — override these or use a .env file ────────────────────────
       # docker compose will automatically load a .env file in the same directory.
