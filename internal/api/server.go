@@ -94,7 +94,6 @@ func (s *Server) routes() http.Handler {
 
 	// ── API v1 ────────────────────────────────────────────────────────────────
 	r.Route("/api", func(r chi.Router) {
-
 		// Sessions — no auth required (anonymous creation).
 		r.Post("/session", s.handleCreateSession)
 
@@ -102,6 +101,7 @@ func (s *Server) routes() http.Handler {
 		r.Route("/session/{sessionID}", func(r chi.Router) {
 			r.Use(s.requireAnonToken)
 			r.Patch("/context", s.handleUpdateContext)
+			r.Get("/questions", s.handleGetQuestions)
 			r.Put("/answers", s.handleUpsertAnswers)
 			r.Post("/checkout", s.handleCreateCheckout)
 		})
