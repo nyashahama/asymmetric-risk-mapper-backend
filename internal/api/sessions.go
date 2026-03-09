@@ -1,147 +1,145 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"fmt"
-	"net/http"
-	"strings"
 
-	"github.com/go-chi/chi/v5"
+	apiv1 "github.com/nyashahama/asymmetric-risk-mapper-backend/gen/api/v1"
 	"github.com/nyashahama/asymmetric-risk-mapper-backend/internal/db"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/status"
 )
 
-// ─── POST /api/session ────────────────────────────────────────────────────────
-
-type createSessionRequest struct {
-	// Context fields are optional at creation — the user fills them in Step 1.
-	BizName  string `json:"biz_name"`
-	Industry string `json:"industry"`
-	Stage    string `json:"stage"`
-}
-
-type createSessionResponse struct {
-	SessionID  string `json:"session_id"`
-	AnonToken  string `json:"anon_token"`
-}
-
-// handleCreateSession creates an anonymous session for a new visitor.
-// Called once when the assessment page first loads.
+// ─── CreateSession ────────────────────────────────────────────────────────────
 //
-// The anon_token is returned to the browser and stored in sessionStorage.
-// It is sent as X-Anon-Token on all subsequent session-scoped requests.
-func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
-	var req createSessionRequest
-	if !decode(w, r, &req) {
-		return
-	}
+// Public RPC — no auth required. Creates an anonymous session and returns the
+// session ID and a cryptographically random anon token.
+//
+// UTM params and browser metadata previously extracted from HTTP query params
+// and headers are now fields in the request message — the client is responsible
+// for reading them from window.location and document.referrer and including
+// them in the request.
 
-	// Generate a cryptographically random token. 32 bytes → 64 hex chars.
+func (s *Server) CreateSession(
+	ctx context.Context,
+	req *apiv1.CreateSessionRequest,
+) (*apiv1.CreateSessionResponse, error) {
+	// Generate a cryptographically random 32-byte token → 64 hex chars.
 	tokenBytes := make([]byte, 32)
 	if _, err := rand.Read(tokenBytes); err != nil {
-		s.respondInternalErr(w, r, fmt.Errorf("generate anon token: %w", err))
-		return
+		return nil, s.internalErr(ctx, "CreateSession", fmt.Errorf("generate anon token: %w", err))
 	}
 	anonToken := hex.EncodeToString(tokenBytes)
 
-	// Hash the real IP for fraud logging — never store the raw IP.
-	ipHash := hashIP(realIP(r))
+	// Hash the peer IP for fraud logging. In gRPC the remote address comes
+	// from peer.FromContext. Behind a proxy, the real IP may be in the
+	// "x-real-ip" metadata key — we check both.
+	ipHash := hashPeerIP(ctx)
 
-	session, err := s.q.CreateSession(r.Context(), db.CreateSessionParams{
+	// Pull user-agent from gRPC metadata (set by the client SDK).
+	userAgent := firstMeta(ctx, "user-agent")
+
+	params := db.CreateSessionParams{
 		AnonToken:   anonToken,
-		UtmSource:   nullString(r.URL.Query().Get("utm_source")),
-		UtmMedium:   nullString(r.URL.Query().Get("utm_medium")),
-		UtmCampaign: nullString(r.URL.Query().Get("utm_campaign")),
-		Referrer:    nullString(r.Referer()),
+		UtmSource:   nullString(req.UtmSource),
+		UtmMedium:   nullString(req.UtmMedium),
+		UtmCampaign: nullString(req.UtmCampaign),
+		Referrer:    nullString(req.Referrer),
 		IpHash:      nullString(ipHash),
-		UserAgent:   nullString(r.UserAgent()),
-	})
+		UserAgent:   nullString(userAgent),
+	}
+
+	session, err := s.q.CreateSession(ctx, params)
 	if err != nil {
-		s.respondInternalErr(w, r, fmt.Errorf("create session: %w", err))
-		return
+		return nil, s.internalErr(ctx, "CreateSession", fmt.Errorf("create session: %w", err))
 	}
 
 	// If context was provided at creation time, persist it immediately.
+	// Non-fatal — context can be set via UpdateContext later.
 	if req.BizName != "" || req.Industry != "" || req.Stage != "" {
-		_, err = s.q.UpdateSessionContext(r.Context(), db.UpdateSessionContextParams{
+		_, err = s.q.UpdateSessionContext(ctx, db.UpdateSessionContextParams{
 			ID:       session.ID,
 			BizName:  nullString(req.BizName),
 			Industry: nullString(req.Industry),
 			Stage:    nullString(req.Stage),
 		})
 		if err != nil {
-			// Non-fatal — context can be set via PATCH later.
-			s.logger.Warn("create session: failed to set initial context",
+			s.logger.Warn("CreateSession: failed to set initial context",
 				"session_id", session.ID,
 				"error", err,
-				logField(r),
 			)
 		}
 	}
 
-	respond(w, http.StatusCreated, createSessionResponse{
-		SessionID: session.ID.String(),
+	return &apiv1.CreateSessionResponse{
+		SessionId: session.ID.String(),
 		AnonToken: anonToken,
-	})
+	}, nil
 }
 
-// ─── PATCH /api/session/:sessionID/context ────────────────────────────────────
+// ─── UpdateContext ────────────────────────────────────────────────────────────
+//
+// Protected by anonTokenInterceptor. Persists the business context collected
+// in Step 1 of the assessment (ContextStep).
 
-type updateContextRequest struct {
-	BizName  string `json:"biz_name"`
-	Industry string `json:"industry"`
-	Stage    string `json:"stage"`
-}
-
-type updateContextResponse struct {
-	SessionID string `json:"session_id"`
-	BizName   string `json:"biz_name"`
-	Industry  string `json:"industry"`
-	Stage     string `json:"stage"`
-}
-
-// handleUpdateContext persists the business context from Step 1 (ContextStep).
-// The route is protected by requireAnonToken middleware, so session_id in the
-// URL is already verified to belong to the token sender.
-func (s *Server) handleUpdateContext(w http.ResponseWriter, r *http.Request) {
-	sessionID, err := parseUUID(chi.URLParam(r, "sessionID"))
+func (s *Server) UpdateContext(
+	ctx context.Context,
+	req *apiv1.UpdateContextRequest,
+) (*apiv1.UpdateContextResponse, error) {
+	sessionID, err := parseUUID(req.SessionId)
 	if err != nil {
-		respondErr(w, http.StatusBadRequest, "invalid session_id")
-		return
+		return nil, status.Error(codes.InvalidArgument, "invalid session_id")
 	}
 
-	var req updateContextRequest
-	if !decode(w, r, &req) {
-		return
+	if req.BizName == "" && req.Industry == "" && req.Stage == "" {
+		return nil, status.Error(codes.InvalidArgument, "at least one context field must be non-empty")
 	}
 
-	session, err := s.q.UpdateSessionContext(r.Context(), db.UpdateSessionContextParams{
+	session, err := s.q.UpdateSessionContext(ctx, db.UpdateSessionContextParams{
 		ID:       sessionID,
 		BizName:  nullString(req.BizName),
 		Industry: nullString(req.Industry),
 		Stage:    nullString(req.Stage),
 	})
 	if err != nil {
-		s.respondInternalErr(w, r, fmt.Errorf("update context: %w", err))
-		return
+		return nil, s.internalErr(ctx, "UpdateContext", fmt.Errorf("update context: %w", err))
 	}
 
-	respond(w, http.StatusOK, updateContextResponse{
-		SessionID: session.ID.String(),
+	return &apiv1.UpdateContextResponse{
+		SessionId: session.ID.String(),
 		BizName:   session.BizName.String,
 		Industry:  session.Industry.String,
 		Stage:     session.Stage.String,
-	})
+	}, nil
 }
 
 // ─── HELPERS ─────────────────────────────────────────────────────────────────
 
-// nullString converts a Go string to sql.NullString. Empty string → NULL.
-func nullString(s string) sql.NullString {
-	s = strings.TrimSpace(s)
-	return sql.NullString{String: s, Valid: s != ""}
+// hashPeerIP extracts the client IP from the gRPC peer info or the x-real-ip
+// metadata key (set by a reverse proxy), then returns its SHA-256 hex hash.
+func hashPeerIP(ctx context.Context) string {
+	// Check x-real-ip metadata first (set by Nginx/Envoy in front of the service).
+	if ip := firstMeta(ctx, "x-real-ip"); ip != "" {
+		return hashIP(ip)
+	}
+	// Fall back to the transport-level peer address.
+	if p, ok := peer.FromContext(ctx); ok && p.Addr != nil {
+		addr := p.Addr.String()
+		// addr is "ip:port" — strip port.
+		for i := len(addr) - 1; i >= 0; i-- {
+			if addr[i] == ':' {
+				addr = addr[:i]
+				break
+			}
+		}
+		return hashIP(addr)
+	}
+	return ""
 }
 
 // hashIP returns the hex-encoded SHA-256 of the IP string.
@@ -150,19 +148,15 @@ func hashIP(ip string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// realIP extracts the client IP, honouring X-Real-IP set by a reverse proxy.
-func realIP(r *http.Request) string {
-	if ip := r.Header.Get("X-Real-IP"); ip != "" {
-		return ip
+// firstMeta returns the first value of a metadata key, or "".
+func firstMeta(ctx context.Context, key string) string {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return ""
 	}
-	// RemoteAddr is "ip:port".
-	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx >= 0 {
-		return r.RemoteAddr[:idx]
+	vals := md.Get(key)
+	if len(vals) == 0 {
+		return ""
 	}
-	return r.RemoteAddr
-}
-
-// parseUUID wraps uuid.Parse with a cleaner error.
-func parseUUID(s string) (uuidType, error) {
-	return uuidParse(s)
+	return vals[0]
 }
