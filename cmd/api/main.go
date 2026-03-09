@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/lib/pq" // postgres driver
+	"github.com/soheilhy/cmux"
 
 	"github.com/nyashahama/asymmetric-risk-mapper-backend/internal/ai"
 	"github.com/nyashahama/asymmetric-risk-mapper-backend/internal/api"
@@ -25,8 +27,6 @@ import (
 )
 
 func main() {
-	// ── Logger ────────────────────────────────────────────────────────────────
-	// JSON in production, pretty text in development.
 	var logger *slog.Logger
 	if os.Getenv("ENV") == "production" {
 		logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -61,15 +61,13 @@ func run(logger *slog.Logger) error {
 	defer pool.Close()
 	logger.Info("database connected")
 
-	// ── Store (atomic multi-step writes) ──────────────────────────────────────
+	// ── Store ─────────────────────────────────────────────────────────────────
 	st := store.New(pool, queries)
 
 	// ── Stripe ────────────────────────────────────────────────────────────────
 	stripeClient := stripeinternal.NewClient(cfg.StripeSecretKey)
 
-	// ── AI ────────────────────────────────────────────────────────────────────
-	// DeepSeek is primary. Anthropic is the fallback when ANTHROPIC_API_KEY is
-	// also set. In production, set both keys for maximum resilience.
+	// ── AI (DeepSeek primary, Anthropic fallback) ─────────────────────────────
 	var hedger ai.Hedger
 	switch {
 	case cfg.DeepSeekAPIKey != "" && cfg.AnthropicAPIKey != "":
@@ -85,7 +83,7 @@ func run(logger *slog.Logger) error {
 		logger.Info("ai: using Anthropic only")
 	}
 
-	// ── Email (Resend) ────────────────────────────────────────────────────────
+	// ── Email ─────────────────────────────────────────────────────────────────
 	mailer := email.NewResendClient(
 		cfg.ResendAPIKey,
 		cfg.EmailFromAddr,
@@ -102,12 +100,16 @@ func run(logger *slog.Logger) error {
 		MaxRetries:   cfg.MaxRetries,
 	}, logger)
 
-	// ── HTTP server ───────────────────────────────────────────────────────────
-	handler := api.NewServer(
+	// ── gRPC server + Stripe webhook handler ──────────────────────────────────
+	// NewServer returns both the *grpc.Server (for Serve) and the *api.Server
+	// (for StripeWebhookHandler). They must be separate because *grpc.Server
+	// is the transport and *api.Server holds the application logic including
+	// the HTTP/1.1 webhook handler that Stripe requires.
+	grpcSrv, apiSrv := api.NewServer(
 		queries,
 		st,
 		stripeClient,
-		runner, // *Runner satisfies worker.Enqueuer
+		runner,
 		mailer,
 		api.Config{
 			BaseURL:             cfg.BaseURL,
@@ -117,70 +119,108 @@ func run(logger *slog.Logger) error {
 		logger,
 	)
 
-	srv := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      handler,
+	// ── Single TCP listener, split by protocol with cmux ──────────────────────
+	lis, err := net.Listen("tcp", ":"+cfg.Port)
+	if err != nil {
+		return fmt.Errorf("listen: %w", err)
+	}
+
+	mux := cmux.New(lis)
+
+	// HTTP/2 frames with "application/grpc" content-type → gRPC server.
+	grpcLis := mux.MatchWithWriters(
+		cmux.HTTP2MatchHeaderFieldSendSettings("content-type", "application/grpc"),
+	)
+
+	// Everything else (HTTP/1.1) → Stripe webhook + health check.
+	httpLis := mux.Match(cmux.Any())
+
+	webhookMux := http.NewServeMux()
+	webhookMux.Handle("/api/webhooks/stripe", apiSrv.StripeWebhookHandler())
+	webhookMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	httpSrv := &http.Server{
+		Handler:      webhookMux,
 		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 60 * time.Second, // generous — report endpoint can be slow on first hit
+		WriteTimeout: 30 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
-	// Root context cancelled by OS signal. Worker and HTTP server both respect it.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Start the worker pool in a background goroutine. It blocks until ctx is done.
 	go runner.Start(ctx)
 
-	// Start the HTTP server in a background goroutine.
-	serverErr := make(chan error, 1)
 	go func() {
-		logger.Info("server listening", "addr", srv.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			serverErr <- err
+		if err := mux.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logger.Error("cmux serve error", "error", err)
 		}
 	}()
 
-	// Block until either a signal arrives or the server dies unexpectedly.
+	grpcErrCh := make(chan error, 1)
+	go func() {
+		logger.Info("gRPC server listening", "addr", lis.Addr())
+		if err := grpcSrv.Serve(grpcLis); err != nil {
+			grpcErrCh <- err
+		}
+	}()
+
+	httpErrCh := make(chan error, 1)
+	go func() {
+		logger.Info("HTTP (webhook) server listening", "addr", lis.Addr())
+		if err := httpSrv.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			httpErrCh <- err
+		}
+	}()
+
 	select {
 	case <-ctx.Done():
 		logger.Info("shutdown signal received")
-	case err := <-serverErr:
-		return fmt.Errorf("server error: %w", err)
+	case err := <-grpcErrCh:
+		return fmt.Errorf("gRPC server error: %w", err)
+	case err := <-httpErrCh:
+		return fmt.Errorf("HTTP server error: %w", err)
 	}
 
-	// Give in-flight HTTP requests up to 20 seconds to finish.
+	stopped := make(chan struct{})
+	go func() {
+		grpcSrv.GracefulStop()
+		close(stopped)
+	}()
+
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("server shutdown: %w", err)
+	select {
+	case <-stopped:
+		logger.Info("gRPC server stopped gracefully")
+	case <-shutdownCtx.Done():
+		logger.Warn("gRPC graceful stop timed out, forcing")
+		grpcSrv.Stop()
 	}
 
-	// The worker goroutine will exit when ctx is cancelled (already done).
-	// runner.Start blocks until all worker goroutines finish — nothing extra needed.
+	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("HTTP server shutdown error", "error", err)
+	}
+
 	logger.Info("shutdown complete")
 	return nil
 }
 
-// openDB opens the connection pool and verifies connectivity.
-// Uses db.New (unprepared queries) instead of db.Prepare so the app works
-// with PgBouncer in transaction-pooling mode (e.g. Supabase port 6543).
-// Prepared statements are incompatible with transaction-mode pooling.
 func openDB(dsn string) (*sql.DB, *db.Queries, error) {
 	pool, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open: %w", err)
 	}
 
-	// Tune the connection pool.
 	pool.SetMaxOpenConns(25)
 	pool.SetMaxIdleConns(10)
 	pool.SetConnMaxLifetime(5 * time.Minute)
 	pool.SetConnMaxIdleTime(2 * time.Minute)
 
-	// Verify the connection is reachable before proceeding.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -189,10 +229,6 @@ func openDB(dsn string) (*sql.DB, *db.Queries, error) {
 		return nil, nil, fmt.Errorf("ping: %w", err)
 	}
 
-	// db.New uses unprepared queries — compatible with PgBouncer transaction
-	// pooling mode. If you ever switch to a direct connection you can swap this
-	// back to db.Prepare for startup-time schema validation.
 	queries := db.New(pool)
-
 	return pool, queries, nil
 }
