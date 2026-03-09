@@ -1,0 +1,195 @@
+syntax = "proto3";
+
+package api.v1;
+
+option go_package = "github.com/nyashahama/asymmetric-risk-mapper-backend/gen/api/v1;apiv1";
+
+// ─── SERVICE ──────────────────────────────────────────────────────────────────
+
+service RiskMapper {
+  // Session lifecycle
+  rpc CreateSession(CreateSessionRequest)   returns (CreateSessionResponse);
+  rpc UpdateContext(UpdateContextRequest)   returns (UpdateContextResponse);
+
+  // Questionnaire
+  rpc GetQuestions(GetQuestionsRequest)     returns (GetQuestionsResponse);
+  rpc UpsertAnswers(UpsertAnswersRequest)   returns (UpsertAnswersResponse);
+
+  // Payment
+  rpc CreateCheckout(CreateCheckoutRequest) returns (CreateCheckoutResponse);
+
+  // Report retrieval (opaque access token, no session auth)
+  rpc GetReport(GetReportRequest)           returns (GetReportResponse);
+
+  // Stripe webhook passthrough — raw bytes + signature header
+  // This RPC is only served over HTTP/1.1 via the side-car mux (see main.go).
+  // It is declared here for documentation purposes; grpc-gateway transcodes it.
+  rpc StripeWebhook(StripeWebhookRequest)   returns (StripeWebhookResponse);
+}
+
+// ─── SESSION ──────────────────────────────────────────────────────────────────
+
+message CreateSessionRequest {
+  // Optional business context — may be set now or later via UpdateContext.
+  string biz_name  = 1;
+  string industry  = 2;
+  string stage     = 3;
+
+  // UTM attribution — sent by the client from window.location.search.
+  string utm_source   = 4;
+  string utm_medium   = 5;
+  string utm_campaign = 6;
+
+  // Browser metadata — sent by the client from document.referrer / navigator.
+  string referrer    = 7;
+  string user_agent  = 8;
+}
+
+message CreateSessionResponse {
+  string session_id  = 1;
+  // anon_token must be stored client-side (sessionStorage) and sent as
+  // the "x-anon-token" metadata key on all subsequent session-scoped RPCs.
+  string anon_token  = 2;
+}
+
+// ─── CONTEXT ─────────────────────────────────────────────────────────────────
+
+// UpdateContextRequest is protected by the anonTokenInterceptor.
+// session_id is read from the request message (not the URL — this is gRPC).
+message UpdateContextRequest {
+  string session_id = 1;
+  string biz_name   = 2;
+  string industry   = 3;
+  string stage      = 4;
+}
+
+message UpdateContextResponse {
+  string session_id = 1;
+  string biz_name   = 2;
+  string industry   = 3;
+  string stage      = 4;
+}
+
+// ─── QUESTIONS ────────────────────────────────────────────────────────────────
+
+message GetQuestionsRequest {
+  string session_id = 1;
+}
+
+message QuestionOption {
+  string label   = 1;
+  int32  p_score = 2;
+  int32  i_score = 3;
+}
+
+message Question {
+  string id            = 1;
+  string section_id    = 2;
+  string section_title = 3;
+  int32  display_order = 4;
+  string text          = 5;
+  string subtext       = 6;
+  // type is "radio" or "text" — matches the db enum values.
+  string type          = 7;
+  // options is populated only for radio questions.
+  repeated QuestionOption options     = 8;
+  string placeholder   = 9;
+  bool   required      = 10;
+  bool   is_scoring    = 11;
+  string risk_name     = 12;
+  string risk_desc     = 13;
+  // saved_answer is the session's current answer for this question ("" if none).
+  string saved_answer  = 14;
+}
+
+message GetQuestionsResponse {
+  repeated Question questions    = 1;
+  int32             total_answered = 2;
+}
+
+// ─── ANSWERS ─────────────────────────────────────────────────────────────────
+
+message AnswerInput {
+  string session_id  = 1;
+  string question_id = 2;
+  string answer_text = 3;
+  // client_p / client_i are the client-side preview scores.
+  // Optional — stored for audit; server always recomputes.
+  optional int32 client_p = 4;
+  optional int32 client_i = 5;
+}
+
+message UpsertAnswersRequest {
+  string session_id          = 1;
+  repeated AnswerInput answers = 2;
+}
+
+message UpsertAnswersResponse {
+  int32 upserted = 1;
+}
+
+// ─── CHECKOUT ─────────────────────────────────────────────────────────────────
+
+message CreateCheckoutRequest {
+  string session_id = 1;
+  string email      = 2;
+}
+
+message CreateCheckoutResponse {
+  // client_secret is the Stripe PaymentIntent client_secret.
+  // Pass this to Stripe.js to render the payment UI.
+  string client_secret = 1;
+  // is_existing is true when the session already had a PaymentIntent.
+  bool   is_existing   = 2;
+}
+
+// ─── REPORT ──────────────────────────────────────────────────────────────────
+
+message GetReportRequest {
+  // access_token is the opaque token from the delivery email link.
+  // No session authentication required for this RPC.
+  string access_token = 1;
+}
+
+message RiskResult {
+  int32  rank        = 1;
+  string question_id = 2;
+  string risk_name   = 3;
+  string risk_desc   = 4;
+  int32  probability = 5;
+  int32  impact      = 6;
+  int32  score       = 7;
+  // tier is one of: "watch", "red", "manage", "ignore"
+  string tier        = 8;
+  string section     = 9;
+  string hedge       = 10;
+}
+
+message GetReportResponse {
+  string report_id          = 1;
+  // status is one of: "draft", "processing", "ready", "error"
+  string status             = 2;
+  string biz_name           = 3;
+  string industry           = 4;
+  string stage              = 5;
+  int32  overall_score      = 6;
+  int32  critical_count     = 7;
+  string executive_summary  = 8;
+  string top_priority_html  = 9;
+  repeated RiskResult risks = 10;
+  // generated_at is RFC3339 UTC, empty while report is not yet ready.
+  string generated_at       = 11;
+}
+
+// ─── STRIPE WEBHOOK ───────────────────────────────────────────────────────────
+
+// StripeWebhookRequest carries the raw HTTP body and Stripe-Signature header.
+// This is only reachable via the HTTP/1.1 side-mux — Stripe cannot call gRPC.
+message StripeWebhookRequest {
+  bytes  payload          = 1;
+  string stripe_signature = 2;
+}
+
+message StripeWebhookResponse {
+  bool ok = 1;
+}
